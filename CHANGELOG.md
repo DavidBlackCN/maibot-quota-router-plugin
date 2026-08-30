@@ -1,5 +1,13 @@
 # 更新日志
 
+## 4.0.0
+
+- 新增按模型别名独立统计的自然日 Token 配额。
+- 新增 `llm.model.before_attempt` 模型级 Hook：超额模型在 Provider 请求前被跳过，并复用 MaiBot 原有 fallback。
+- 配额跳过不触发全局 Hold、不阻断消息入站，也不计入 Provider 重试或模型失败 penalty。
+- 保留原有静态限制、动态预算、错误阈值、通知与管理命令配置。
+- 插件更名为 `maibot-quota-router-plugin`，保留原 manifest ID 以兼容已有插件配置。
+
 ## 3.2.1
 
 - 优化统计文本

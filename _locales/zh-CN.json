@@ -1,4 +1,4 @@
 {
-  "plugin.name": "稍，稍等一下！",
-  "plugin.description": "为 模型/厂商/功能 提供RPM，智能限速"
+  "plugin.name": "maibot-quota-router-plugin",
+  "plugin.description": "单模型每日 Token 配额、自动降级路由与兼容的 LLM 消耗限速"
 }

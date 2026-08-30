@@ -127,14 +127,23 @@ def aggregate_usage_rows(
     }
 
 
-async def _query_model_usage(database: Any, *, limit: int, logger: Any = None) -> List[Dict[str, Any]]:
+async def _query_model_usage(
+    database: Any,
+    *,
+    limit: int,
+    logger: Any = None,
+    model_name: str = "",
+) -> List[Dict[str, Any]]:
+    query_args: Dict[str, Any] = {
+        "model_name": "ModelUsage",
+        "query_type": "get",
+        "order_by": ["-id"],
+        "limit": max(100, int(limit or 5000)),
+    }
+    if model_name:
+        query_args["filters"] = {"model_assign_name": model_name}
     try:
-        result = await database.query(
-            model_name="ModelUsage",
-            query_type="get",
-            order_by=["-id"],
-            limit=max(100, int(limit or 5000)),
-        )
+        result = await database.query(**query_args)
     except Exception as exc:
         if logger is not None:
             logger.warning("hold_on 读取 ModelUsage 失败: %s", exc)
@@ -158,6 +167,7 @@ async def aggregate_usage(
     start: datetime,
     end: datetime,
     limit: int = 5000,
+    model_name: str = "",
 ) -> Dict[str, Any]:
     """通过 ctx.db 拉取 ModelUsage，再按 [start, end] 过滤并聚合。"""
 
@@ -168,7 +178,12 @@ async def aggregate_usage(
             logger.warning("hold_on 缺少 ctx.db，无法读取 llm_usage")
         return {"total": _empty_total(), "groups": [], "rows": [], "window_rows": []}
 
-    rows = await _query_model_usage(database, limit=limit, logger=logger)
+    rows = await _query_model_usage(
+        database,
+        limit=limit,
+        logger=logger,
+        model_name=str(model_name or "").strip(),
+    )
     return aggregate_usage_rows(
         rows,
         start_ts=start.timestamp(),

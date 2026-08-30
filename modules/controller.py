@@ -92,6 +92,41 @@ def check_budget(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: dateti
     return None
 
 
+def check_daily_quota(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: datetime) -> Optional[Decision]:
+    """检查自然日总额度，不套用动态预算的计划消耗曲线。"""
+
+    progress = daily_quota_progress(groups, rule)
+    if progress["actual"] < rule.amount:
+        return None
+    reset_seconds = max(1.0, (rule.end - now).total_seconds())
+    return Decision(
+        True,
+        f"model:{rule.target} tokens 每日配额 {progress['actual']:g}/{rule.amount:g}",
+        rule.scope,
+        rule.target,
+        rule.metric,
+        progress["actual"],
+        rule.amount,
+        progress["remaining"],
+        "quota",
+        reset_seconds,
+    )
+
+
+def daily_quota_progress(groups: Iterable[Dict[str, Any]], rule: BudgetRule) -> Dict[str, float]:
+    """汇总单个自然日规则的实际消耗与剩余额度。"""
+
+    actual = 0.0
+    for group in groups:
+        if matches(group, rule.scope, rule.target):
+            actual += metric_value(group, rule.metric, rule.input_weight, rule.output_weight)
+    return {
+        "actual": actual,
+        "limit": float(rule.amount),
+        "remaining": max(0.0, float(rule.amount) - actual),
+    }
+
+
 def budget_progress(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: datetime) -> Dict[str, float]:
     duration = max(1.0, (rule.end - rule.start).total_seconds())
     elapsed = max(0.0, min((now - rule.start).total_seconds(), duration))

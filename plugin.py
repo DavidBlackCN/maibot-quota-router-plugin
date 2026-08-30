@@ -1,8 +1,11 @@
-"""稍，稍等一下！: LLM 消耗监控与入站限速。"""
+"""maibot-quota-router-plugin：模型配额路由与兼容的 LLM 消耗限速。"""
 from __future__ import annotations
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
+
+import asyncio
+
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
 try:
@@ -12,7 +15,9 @@ try:
         LimitRule,
         budget_progress,
         check_budget,
+        check_daily_quota,
         check_static,
+        daily_quota_progress,
         static_progress,
     )
     from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
@@ -28,7 +33,9 @@ except ImportError:  # pragma: no cover - 兼容直接脚本导入
         LimitRule,
         budget_progress,
         check_budget,
+        check_daily_quota,
         check_static,
+        daily_quota_progress,
         static_progress,
     )
     from modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
@@ -43,7 +50,7 @@ class PluginConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用消耗限速")
-    config_version: str = Field(default="3.0.0", description="配置版本")
+    config_version: str = Field(default="4.0.0", description="配置版本")
     auto_detect_models: bool = Field(default=True, description="自动同步模型、厂商和功能")
     model_config_path: str = Field(default="", description="宿主 model_config.toml 路径，留空自动查找")
     forward_image_threshold: int = Field(default=0, ge=0, description="合并转发消息图片数达到该值时阻止入站；0 表示禁用")
@@ -109,6 +116,27 @@ class BudgetConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="启用后只使用动态预算，不叠加静态限制")
     items: list[BudgetRuleConfig] = Field(default_factory=list, description="每日成本或 token 预算")
 
+
+class ModelQuotaRuleConfig(PluginConfigBase):
+    model: str = Field(default="", description="模型别名，对应 model_config.toml 中的 models.name")
+    daily_token_limit: int = Field(default=2_000_000, gt=0, description="自然日 Token 上限")
+    input_weight: float = Field(default=1.0, ge=0, description="输入 Token 倍率")
+    output_weight: float = Field(default=1.0, ge=0, description="输出 Token 倍率")
+
+
+class ModelQuotasConfig(PluginConfigBase):
+    __ui_label__ = "模型每日配额"
+    __ui_icon__ = "route"
+    __ui_order__ = 5
+    enabled: bool = Field(default=True, description="启用单模型自然日 Token 配额与自动降级")
+    usage_limit: int = Field(
+        default=5000,
+        ge=100,
+        le=100000,
+        description="每个模型最多读取的当日成功调用记录数",
+    )
+    items: list[ModelQuotaRuleConfig] = Field(default_factory=list, description="模型每日 Token 配额列表")
+
 class ErrorThresholdRule(PluginConfigBase):
     scope: Literal["provider", "model", "feature"] = Field(default="feature", description="计数范围")
     name: str = Field(default="", description="目标名；空表示按实际命中目标各自计数")
@@ -120,7 +148,7 @@ class ErrorThresholdRule(PluginConfigBase):
 class ErrorRulesConfig(PluginConfigBase):
     __ui_label__ = "错误阈值"
     __ui_icon__ = "shield-off"
-    __ui_order__ = 5
+    __ui_order__ = 6
     enabled: bool = Field(default=True, description="错误次数达限时停止入站；与消耗限速可同时生效")
     items: list[ErrorThresholdRule] = Field(
         default_factory=lambda: [
@@ -140,7 +168,7 @@ class ErrorRulesConfig(PluginConfigBase):
 class ErrorWatchConfig(PluginConfigBase):
     __ui_label__ = "错误统计"
     __ui_icon__ = "alert-triangle"
-    __ui_order__ = 6
+    __ui_order__ = 7
     enabled: bool = Field(default=True, description="监听 schema v3 错误快照")
     interval_seconds: float = Field(default=2.0, ge=0.5, description="扫描间隔秒数")
     roots: list[str] = Field(default_factory=list, description="额外错误目录")
@@ -148,7 +176,7 @@ class ErrorWatchConfig(PluginConfigBase):
 class NotifyConfig(PluginConfigBase):
     __ui_label__ = "通知"
     __ui_icon__ = "corner-up-right"
-    __ui_order__ = 7
+    __ui_order__ = 8
     enabled: bool = Field(default=False, description="停止入站时转发通知")
     target_type: Literal["group", "private", "stream_id"] = Field(default="group", description="通知目标类型")
     group_id: str = Field(default="", description="群号")
@@ -159,7 +187,7 @@ class NotifyConfig(PluginConfigBase):
 class PermissionConfig(PluginConfigBase):
     __ui_label__ = "权限"
     __ui_icon__ = "shield"
-    __ui_order__ = 8
+    __ui_order__ = 9
     whitelist: list[str] = Field(default_factory=list, description="管理命令白名单")
     notify_permission_denied: bool = Field(default=True, description="无权限时是否提示")
 class HoldOnConfig(PluginConfigBase):
@@ -168,16 +196,18 @@ class HoldOnConfig(PluginConfigBase):
     catalog: CatalogConfig = Field(default_factory=CatalogConfig)
     static_limits: StaticLimitsConfig = Field(default_factory=StaticLimitsConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    model_quotas: ModelQuotasConfig = Field(default_factory=ModelQuotasConfig)
     error_rules: ErrorRulesConfig = Field(default_factory=ErrorRulesConfig)
     error_watch: ErrorWatchConfig = Field(default_factory=ErrorWatchConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     permission: PermissionConfig = Field(default_factory=PermissionConfig)
 
-class HoldOnPlugin(MaiBotPlugin):
+class QuotaRouterPlugin(MaiBotPlugin):
     config_model = HoldOnConfig
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
+        self._quota_lock = asyncio.Lock()
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
@@ -277,13 +307,98 @@ class HoldOnPlugin(MaiBotPlugin):
             )
         return True
 
-    async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
+    async def _usage(self, start: datetime, end: datetime, model_name: str = "") -> Dict[str, Any]:
         return await aggregate_usage(
             self.ctx,
             start,
             end,
             self.config.stats.usage_limit,
+            model_name=model_name,
         )
+
+    @staticmethod
+    def _natural_day(now: datetime) -> tuple[datetime, datetime]:
+        start = datetime.combine(now.date(), time.min)
+        return start, start + timedelta(days=1)
+
+    def _find_model_quota(self, model_name: str) -> Optional[ModelQuotaRuleConfig]:
+        if not self.config.model_quotas.enabled:
+            return None
+        wanted = str(model_name or "").strip()
+        if not wanted:
+            return None
+        for item in self.config.model_quotas.items or []:
+            if str(item.model or "").strip() == wanted:
+                return item
+        return None
+
+    async def _check_model_quota(
+        self,
+        model_name: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[Decision]:
+        item = self._find_model_quota(model_name)
+        if item is None:
+            return None
+        current = now or datetime.now()
+        start, end = self._natural_day(current)
+        metrics = await aggregate_usage(
+            self.ctx,
+            start,
+            current,
+            int(self.config.model_quotas.usage_limit or 5000),
+            model_name=model_name,
+        )
+        rule = BudgetRule(
+            scope="model",
+            target=model_name,
+            metric="tokens",
+            amount=float(item.daily_token_limit),
+            start=start,
+            end=end,
+            input_weight=float(item.input_weight),
+            output_weight=float(item.output_weight),
+        )
+        return check_daily_quota(metrics.get("groups") or [], rule, current)
+
+    async def _model_quota_status_rows(self, now: datetime) -> list[Dict[str, Any]]:
+        if not self.config.model_quotas.enabled:
+            return []
+        start, end = self._natural_day(now)
+        rows: list[Dict[str, Any]] = []
+        for item in self.config.model_quotas.items or []:
+            model_name = str(item.model or "").strip()
+            if not model_name:
+                continue
+            metrics = await aggregate_usage(
+                self.ctx,
+                start,
+                now,
+                int(self.config.model_quotas.usage_limit or 5000),
+                model_name=model_name,
+            )
+            rule = BudgetRule(
+                scope="model",
+                target=model_name,
+                metric="tokens",
+                amount=float(item.daily_token_limit),
+                start=start,
+                end=end,
+                input_weight=float(item.input_weight),
+                output_weight=float(item.output_weight),
+            )
+            progress = daily_quota_progress(metrics.get("groups") or [], rule)
+            rows.append(
+                {
+                    "model": model_name,
+                    "actual": progress["actual"],
+                    "limit": progress["limit"],
+                    "blocked": progress["actual"] >= progress["limit"],
+                    "reset_at": end,
+                }
+            )
+        return rows
 
     def _period(self, now: datetime, item: BudgetRuleConfig) -> tuple[datetime, datetime]:
         def parse(value: str) -> time:
@@ -786,6 +901,7 @@ class HoldOnPlugin(MaiBotPlugin):
         metrics: Dict[str, Any],
         holding: bool,
         now: Optional[datetime] = None,
+        quota_rows: Optional[list[Dict[str, Any]]] = None,
     ) -> str:
         now = now or end
         lines = [
@@ -825,6 +941,23 @@ class HoldOnPlugin(MaiBotPlugin):
             lines.append(f"【最近错误】{self._format_error_detail(latest_err)[5:]}")
         else:
             lines.append("【最近错误】监听目标暂无错误记录")
+
+        if quota_rows:
+            lines.append("")
+            lines.append("【模型每日配额】")
+            for quota in quota_rows:
+                state = "已跳过" if bool(quota.get("blocked")) else "可用"
+                lines.append(f"【model:{quota.get('model') or '-'}】{state}")
+                lines.append(
+                    self._format_progress_bar(
+                        float(quota.get("actual") or 0),
+                        float(quota.get("limit") or 0),
+                        "tokens",
+                    )
+                )
+                reset_at = quota.get("reset_at")
+                if isinstance(reset_at, datetime):
+                    lines.append(f"自然日重置 {reset_at:%m-%d %H:%M}")
 
         lines.append("")
         lines.append("【统计】")
@@ -869,6 +1002,61 @@ class HoldOnPlugin(MaiBotPlugin):
     async def _send(self, stream_id: str, text: str) -> tuple[bool, str, bool]:
         if stream_id: await self.ctx.send.text(text, stream_id)
         return True, text, True
+
+    @HookHandler(
+        "llm.model.before_attempt",
+        name="quota_router_before_model_attempt",
+        description="模型达到自然日 Token 配额时跳过本次尝试并交由 MaiBot fallback",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=2500,
+    )
+    async def handle_before_model_attempt(
+        self,
+        model_name: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if not self._active():
+            return {"action": "continue"}
+        if self._find_model_quota(model_name) is None:
+            return {"action": "continue"}
+
+        try:
+            async with self._quota_lock:
+                decision = await self._check_model_quota(model_name)
+        except Exception as exc:
+            self.ctx.logger.warning(
+                "quota_router 检查模型每日配额失败，按 fail-open 放行: model=%s error=%s",
+                model_name,
+                exc,
+                exc_info=True,
+            )
+            return {"action": "continue"}
+
+        if decision is None:
+            return {"action": "continue"}
+
+        reset_at = self._natural_day(datetime.now())[1]
+        self.ctx.logger.info(
+            "quota_router 跳过超额模型: model=%s tokens=%s/%s reset_at=%s",
+            model_name,
+            int(decision.actual),
+            int(decision.limit),
+            reset_at.isoformat(timespec="seconds"),
+        )
+        return {
+            "action": "continue",
+            "custom_result": {
+                "skip_model": True,
+                "model_name": model_name,
+                "reason": decision.reason,
+                "used_tokens": int(decision.actual),
+                "limit_tokens": int(decision.limit),
+                "reset_at": reset_at.isoformat(timespec="seconds"),
+            },
+        }
+
     @HookHandler("chat.receive.after_process", name="hold_on_receive_abort", description="消耗达到限制时 LATE abort", mode=HookMode.BLOCKING, order=HookOrder.LATE)
     async def handle_receive_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
         del kwargs
@@ -917,6 +1105,7 @@ class HoldOnPlugin(MaiBotPlugin):
             start = now - timedelta(seconds=self.config.stats.window_seconds)
             display_end = now
         metrics = await self._usage(start, now)
+        quota_rows = await self._model_quota_status_rows(now)
         decision = self._decision(metrics, now)
         holding = self.state.is_holding() or bool(decision)
         return await self._send(
@@ -927,6 +1116,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 metrics=metrics,
                 holding=holding,
                 now=now,
+                quota_rows=quota_rows,
             ),
         )
 
@@ -939,5 +1129,8 @@ class HoldOnPlugin(MaiBotPlugin):
         return await self._send(stream_id, "已解除。")
 
 
-def create_plugin() -> HoldOnPlugin:
-    return HoldOnPlugin()
+HoldOnPlugin = QuotaRouterPlugin
+
+
+def create_plugin() -> QuotaRouterPlugin:
+    return QuotaRouterPlugin()

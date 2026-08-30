@@ -1,0 +1,173 @@
+diff --git a/src/llm_models/utils_model.py b/src/llm_models/utils_model.py
+index 16fb0a0..ca88d0d 100644
+--- a/src/llm_models/utils_model.py
++++ b/src/llm_models/utils_model.py
+@@ -60,6 +60,8 @@ from src.llm_models.payload_content.tool_option import (
+     normalize_tool_options,
+ )
+ from src.llm_models.utils import compress_messages, llm_usage_recorder
++from src.plugin_runtime.hook_schema_utils import build_object_schema
++from src.plugin_runtime.host.hook_spec_registry import HookSpec, HookSpecRegistry
+ 
+ install(extra_lines=3)
+ 
+@@ -78,6 +80,46 @@ EMPTY_TASK_FALLBACKS = {
+ }
+ 
+ 
++def register_llm_model_hook_specs(registry: HookSpecRegistry) -> List[HookSpec]:
++    """注册通用 LLM 模型尝试前 Hook 规格。"""
++
++    return registry.register_hook_specs(
++        [
++            HookSpec(
++                name="llm.model.before_attempt",
++                description="选中候选模型后、向 Provider 发起请求前触发；处理器可请求跳过当前模型。",
++                parameters_schema=build_object_schema(
++                    {
++                        "task_name": {"type": "string", "description": "当前模型任务名。"},
++                        "request_type": {"type": "string", "description": "当前业务请求类型。"},
++                        "model_name": {"type": "string", "description": "当前选中的模型别名。"},
++                        "model_identifier": {"type": "string", "description": "Provider 使用的模型标识。"},
++                        "provider_name": {"type": "string", "description": "当前 Provider 名称。"},
++                        "candidate_model_names": {"type": "array", "description": "任务的候选模型别名列表。"},
++                        "excluded_model_names": {"type": "array", "description": "本次请求已经排除的模型列表。"},
++                        "explicit_model": {"type": "boolean", "description": "调用方是否显式指定了模型。"},
++                        "session_id": {"type": "string", "description": "当前会话 ID；非聊天任务为空。"},
++                    },
++                    required=[
++                        "task_name",
++                        "request_type",
++                        "model_name",
++                        "model_identifier",
++                        "provider_name",
++                        "candidate_model_names",
++                        "excluded_model_names",
++                        "explicit_model",
++                        "session_id",
++                    ],
++                ),
++                default_timeout_ms=3000,
++                allow_abort=False,
++                allow_kwargs_mutation=False,
++            )
++        ]
++    )
++
++
+ class RequestType(Enum):
+     """请求类型枚举"""
+ 
+@@ -119,6 +161,48 @@ class LLMOrchestrator:
+ 
+         return str(session_id or self.session_id or "").strip()
+ 
++    async def _invoke_before_model_attempt_hook(
++        self,
++        *,
++        model_info: ModelInfo,
++        api_provider: APIProvider,
++        excluded_models: Set[str],
++        explicit_model: bool,
++        session_id: str,
++    ) -> str:
++        """返回 Hook 请求跳过当前模型的原因；Hook 故障时放行请求。"""
++
++        try:
++            from src.plugin_runtime.integration import get_plugin_runtime_manager
++
++            hook_result = await get_plugin_runtime_manager().invoke_hook(
++                "llm.model.before_attempt",
++                task_name=self.task_name,
++                request_type=self.request_type,
++                model_name=model_info.name,
++                model_identifier=model_info.model_identifier,
++                provider_name=api_provider.name,
++                candidate_model_names=list(self.model_for_task.model_list),
++                excluded_model_names=sorted(excluded_models),
++                explicit_model=explicit_model,
++                session_id=self._resolve_effective_session_id(session_id),
++            )
++        except Exception as exc:
++            logger.warning(
++                "LLM 模型尝试前 Hook 执行失败，继续使用当前模型: "
++                f"model={model_info.name} error={exc}"
++            )
++            return ""
++
++        for custom_result in hook_result.custom_results:
++            if not isinstance(custom_result, dict) or not bool(custom_result.get("skip_model")):
++                continue
++            result_model_name = str(custom_result.get("model_name") or "").strip()
++            if result_model_name and result_model_name != model_info.name:
++                continue
++            return str(custom_result.get("reason") or "模型尝试前 Hook 请求跳过").strip()
++        return ""
++
+     def _get_task_config_or_raise(self) -> TaskConfig:
+         """获取当前任务名对应的最新任务配置。
+ 
+@@ -1201,6 +1285,7 @@ class LLMOrchestrator:
+             LLMExecutionResult: 单次模型执行结果对象。
+         """
+         failed_models_this_request: Set[str] = set()
++        skipped_model_reasons: Dict[str, str] = {}
+         max_attempts = 1 if str(model_name or "").strip() else len(self.model_for_task.model_list)
+         last_exception: Optional[Exception] = None
+         last_model_name = ""
+@@ -1217,6 +1302,22 @@ class LLMOrchestrator:
+             )
+             last_model_name = model_info.name
+             trace_context.model_attempt = 0
++            skip_reason = await self._invoke_before_model_attempt_hook(
++                model_info=model_info,
++                api_provider=api_provider,
++                excluded_models=failed_models_this_request,
++                explicit_model=bool(str(model_name or "").strip()),
++                session_id=session_id,
++            )
++            if skip_reason:
++                total_tokens, penalty, usage_penalty = self.model_usage[model_info.name]
++                self.model_usage[model_info.name] = (total_tokens, penalty, usage_penalty - 1)
++                failed_models_this_request.add(model_info.name)
++                skipped_model_reasons[model_info.name] = skip_reason
++                logger.info(
++                    f"模型 '{model_info.name}' 被请求前 Hook 跳过，继续选择下一个模型。原因: {skip_reason}"
++                )
++                continue
+             context_items: List[ContextItem] = []
+             if context_factory:
+                 parameter_count = len(inspect.signature(context_factory).parameters)
+@@ -1297,6 +1398,12 @@ class LLMOrchestrator:
+                     logger.warning("收到客户端错误 (400)，跳过当前模型并继续尝试其他模型。")
+                     continue
+ 
++        if len(skipped_model_reasons) >= max_attempts:
++            reason_text = "；".join(
++                f"{skipped_model}: {reason}" for skipped_model, reason in skipped_model_reasons.items()
++            )
++            raise RuntimeError(f"所有候选模型均被请求前 Hook 跳过，未向 Provider 发起请求：{reason_text}")
++
+         logger.error(f"所有 {max_attempts} 个模型均尝试失败。")
+         if last_exception:
+             mark_request_final_failure(last_exception)
+diff --git a/src/plugin_runtime/hook_catalog.py b/src/plugin_runtime/hook_catalog.py
+index a9428be..5118763 100644
+--- a/src/plugin_runtime/hook_catalog.py
++++ b/src/plugin_runtime/hook_catalog.py
+@@ -23,6 +23,7 @@ def _get_builtin_hook_spec_registrars() -> List[HookSpecRegistrar]:
+     from src.emoji_system.emoji_manager import register_emoji_hook_specs
+     from src.learners.expression_learner import register_expression_hook_specs
+     from src.learners.jargon_miner import register_jargon_hook_specs
++    from src.llm_models.utils_model import register_llm_model_hook_specs
+     from src.maisaka.chat_loop_service import register_maisaka_hook_specs
+     from src.services.send_service import register_send_service_hook_specs
+ 
+@@ -31,6 +32,7 @@ def _get_builtin_hook_spec_registrars() -> List[HookSpecRegistrar]:
+         register_emoji_hook_specs,
+         register_jargon_hook_specs,
+         register_expression_hook_specs,
++        register_llm_model_hook_specs,
+         register_send_service_hook_specs,
+         register_maisaka_hook_specs,
+     ]
