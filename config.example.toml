@@ -1,0 +1,223 @@
+# maibot-quota-router-plugin 完整配置示例
+#
+# 这是说明文件，不会被插件自动加载。请根据需要把配置项复制到 MaiBot
+# 为本插件生成的实际配置文件中，或在 WebUI 中填写对应字段。
+#
+# 最小使用方式：
+#   1. 保持 plugin.enabled = true、model_quotas.enabled = true；
+#   2. 修改 [[model_quotas.items]] 中的 model 和 daily_token_limit；
+#   3. 本示例默认关闭 static_limits、budget、error_rules 和 error_watch，
+#      因而只启用“单模型每日配额”；需要旧版功能时再按注释开启。
+#
+# 重要区别：
+#   - model_quotas：只跳过超额模型，MaiBot 会尝试其余候选模型，不触发全局 Hold。
+#   - static_limits / budget / error_rules：沿用旧版 hold_on 行为，可能停止消息入站。
+
+[plugin]
+# 插件总开关。false 会同时关闭模型配额、限速、错误监听和入站保护。
+enabled = true
+
+# 配置结构版本。通常不要手动修改。
+config_version = "4.0.0"
+
+# 自动读取 MaiBot 的 model_config.toml，建立模型、Provider 和功能映射。
+# 推荐保持 true；关闭后可通过 [catalog] 手动提供映射。
+auto_detect_models = true
+
+# MaiBot 的 model_config.toml 路径。空字符串表示由插件自动查找。
+# 自动查找失败时可填写绝对路径，例如：
+# model_config_path = "/opt/bot/maimai/MaiBot/config/model_config.toml"
+model_config_path = ""
+
+# 合并转发消息的图片数量达到此值时，在聊天入站阶段直接阻止消息。
+# 0 表示禁用。此项与模型每日配额无关，通常保持 0。
+forward_image_threshold = 0
+
+
+[stats]
+# 旧版静态限速、状态展示使用的统计窗口，单位为秒。
+window_seconds = 3600
+
+# 每次聚合最多读取的成功 LLM 调用记录数。
+# 该值只用于旧版统计和限速；模型每日配额使用 model_quotas.usage_limit。
+# 当前允许范围为 100～5000。
+usage_limit = 5000
+
+
+[catalog]
+# 自动发现的补充/备用目录。auto_detect_models = true 时通常保持空数组。
+#
+# models 中的 name 是 MaiBot 模型别名，provider 是 Provider 名称。
+# 若要手动配置，请用下面的内容替换 models = []：
+# models = [
+#   { name = "model-a", provider = "openai" },
+#   { name = "model-b", provider = "anthropic" },
+# ]
+models = []
+
+# feature 对应 MaiBot LLM 调用的 task_name，models 是该功能使用的模型别名。
+# 主要供按 feature 限速、预算和错误统计使用。
+# 若要手动配置，请用下面的内容替换 features = []：
+# features = [
+#   { feature = "replyer", models = ["model-a", "model-b"] },
+# ]
+features = []
+
+
+[static_limits]
+# 旧版滑动窗口静态限速开关。触发后会进入全局 Hold，阻止消息入站。
+# 如果只需要每日模型配额，建议保持 false。
+enabled = false
+
+# 默认不启用任何规则。
+# 如需启用，请删除 items = []，取消下面某个 [[static_limits.items]] 示例的注释，
+# 并将 enabled 改为 true。
+items = []
+
+# [[static_limits.items]]
+# # 范围：provider / model / feature。
+# scope = "model"
+# # 目标名称；model 范围下对应模型别名。空字符串表示同范围内各目标分别统计。
+# target = "model-a"
+# # 指标：requests（请求数）/ tokens（Token）/ cost（成本）。
+# metric = "requests"
+# # 滑动窗口长度，单位为秒。
+# window_seconds = 60
+# # 窗口内允许的最大指标值。
+# limit = 10
+# # metric = "tokens" 时输入、输出 Token 的计数倍率。
+# input_weight = 1.0
+# output_weight = 1.0
+
+
+[budget]
+# 旧版动态预算开关。只有 items 中存在规则时才实际参与判断。
+# 触发预算限制后会进入全局 Hold，阻止消息入站。
+# 动态预算存在有效规则时优先于 static_limits，不会与静态规则叠加。
+# 如果只需要每日模型配额，建议改为 false。
+enabled = false
+
+# 默认不启用任何规则。
+# 如需启用，请删除 items = []，取消下面示例的注释，并将 enabled 改为 true。
+items = []
+
+# [[budget.items]]
+# # 范围：provider / model / feature。
+# scope = "model"
+# # 目标名称；空字符串表示该范围内各目标分别判断。
+# target = "model-a"
+# # 指标只支持 tokens 或 cost。
+# metric = "tokens"
+# # start_time 到 end_time 周期内的总额度。
+# amount = 2000000
+# # 每日预算周期；结束时间不晚于开始时间时表示跨越午夜。
+# start_time = "00:00"
+# end_time = "23:59"
+# # strict：按计划进度严格控速；balanced：允许短时间超前消耗。
+# strategy = "strict"
+# # balanced 允许超前的时间，单位为秒；strict 下此值不生效。
+# overshoot_time = 300
+# # 时段外行为：hold = 停止响应；continue = 不按计划控速，但总额用尽仍停止。
+# off_hours = "continue"
+# # Token 指标的输入、输出倍率；cost 指标下不影响成本统计。
+# input_weight = 1.0
+# output_weight = 1.0
+
+
+[model_quotas]
+# 单模型自然日 Token 配额与自动 fallback 总开关。
+# 这是本插件新增的模型级路由功能，不会触发全局 Hold。
+enabled = true
+
+# 检查一个模型时最多读取多少条当日成功调用记录。
+# 如果单模型一天可能成功调用超过 5000 次，应适当提高，最大为 100000；
+# 设置太小会漏掉较早记录，从而低估当日用量。
+usage_limit = 5000
+
+# 每个 [[model_quotas.items]] 对应一个模型。请务必替换下面的 model-a / model-b。
+# model 必须精确匹配
+# MaiBot model_config.toml 中 [[models]].name（模型别名），不是 API model 字符串。
+[[model_quotas.items]]
+model = "model-a"
+# 自然日 Token 上限；按 MaiBot 主机本地时区每天 00:00 自动重置。
+daily_token_limit = 2000000
+# 实际计数 = 输入 Token × input_weight + 输出 Token × output_weight。
+input_weight = 1.0
+output_weight = 1.0
+
+# 可为多个模型分别设置不同额度。请按需删除、复制或修改此规则。
+[[model_quotas.items]]
+model = "model-b"
+daily_token_limit = 500000
+input_weight = 1.0
+output_weight = 1.0
+
+
+[error_rules]
+# 旧版错误阈值总开关。达到阈值后会进入全局 Hold，阻止消息入站。
+# 如果只需要模型每日配额且不希望错误触发全局 Hold，请设为 false。
+enabled = false
+
+[[error_rules.items]]
+# 错误计数范围：provider / model / feature。
+scope = "feature"
+# 目标名称。空字符串表示对实际命中的每个 feature 分别计数。
+name = ""
+# 错误类型：429、4xx、5xx、timeout、connection、* 等；* 表示全部错误。
+error_type = "*"
+# 在这个滑动窗口内累计错误，单位为秒。
+window_seconds = 120
+# 窗口内达到此次数时触发全局 Hold。
+threshold = 5
+# 首次 Hold 时长，单位为秒。
+hold_seconds = 90
+# 连续触发时 Hold 会增长，此值为最大时长，单位为秒。
+hold_max_seconds = 3600
+
+
+[error_watch]
+# 是否扫描 MaiBot schema v3 的 LLM 错误快照。
+# error_rules.enabled = true 时通常应保持 true。
+enabled = false
+
+# 错误目录扫描间隔，单位为秒，最小为 0.5。
+interval_seconds = 2.0
+
+# 额外错误快照目录。空数组表示只扫描插件内置的候选目录。
+# 示例：roots = ["/opt/bot/maimai/MaiBot/data/llm_errors"]
+roots = []
+
+
+[notify]
+# 全局 Hold 触发时是否发送通知。
+# 模型每日配额导致的模型跳过不会发送此通知。
+enabled = false
+
+# 通知目标类型：group（群聊）/ private（私聊）/ stream_id（指定会话）。
+target_type = "group"
+
+# target_type = "group" 时填写群号。
+group_id = ""
+
+# target_type = "private" 时填写用户 ID。
+user_id = ""
+
+# target_type = "stream_id" 时填写 MaiBot stream_id。
+stream_id = ""
+
+# 消息平台，例如 qq。
+platform = "qq"
+
+# 通知文本前缀。
+prefix = "[quota-router]"
+
+
+[permission]
+# 可以执行 /稍等 和 /解除 的用户白名单。
+# 支持裸用户 ID，也支持“平台:用户 ID”，例如：
+# whitelist = ["123456789", "qq:987654321"]
+# 空数组表示没有用户可以执行管理命令。
+whitelist = []
+
+# 非白名单用户执行管理命令时是否回复“权限不足”。
+notify_permission_denied = true

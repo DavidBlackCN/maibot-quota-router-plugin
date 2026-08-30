@@ -7,6 +7,7 @@
 - 配额跳过不触发全局 Hold、不阻断消息入站，也不计入 Provider 重试或模型失败 penalty。
 - 保留原有静态限制、动态预算、错误阈值、通知与管理命令配置。
 - 插件更名为 `maibot-quota-router-plugin`，保留原 manifest ID 以兼容已有插件配置。
+- 新增带完整中文注释的 `config.example.toml`，并说明模型级配额与全局 Hold 配置的区别。
 
 ## 3.2.1
 

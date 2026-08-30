@@ -18,10 +18,24 @@
 
 ## 安装要求
 
-模型级路由依赖新的 `llm.model.before_attempt` Hook。当前 MaiBot 主线尚未内置该 Hook，需要先在 MaiBot 仓库根目录应用随插件提供的补丁：
+模型级路由依赖新的 `llm.model.before_attempt` Hook。当前 MaiBot 主线尚未内置该 Hook，需要先在 MaiBot 仓库根目录检查并应用随插件提供的补丁：
 
 ```bash
-git apply /path/to/maibot-quota-router-plugin/patches/maibot-llm-model-before-attempt.patch
+PATCH=/path/to/maibot-quota-router-plugin/patches/maibot-llm-model-before-attempt.patch
+git apply --check "$PATCH"
+git apply "$PATCH"
+```
+
+`git apply` 成功时默认没有输出，使用反向检查确认补丁已经存在：
+
+```bash
+git apply --check --reverse "$PATCH"
+```
+
+反向检查无输出即表示补丁已应用。也可以查看实际改动：
+
+```bash
+git diff -- src/llm_models/utils_model.py src/plugin_runtime/hook_catalog.py
 ```
 
 补丁基于 MaiBot 主线提交 `27ddf1e8e43531cacb09d385f564cd626366adc3` 制作，只修改：
@@ -29,15 +43,19 @@ git apply /path/to/maibot-quota-router-plugin/patches/maibot-llm-model-before-at
 - `src/llm_models/utils_model.py`
 - `src/plugin_runtime/hook_catalog.py`
 
-升级 MaiBot 后建议先执行：
+升级 MaiBot 后，应先执行正向检查，再决定是否重新应用：
 
 ```bash
-git apply --check /path/to/maibot-quota-router-plugin/patches/maibot-llm-model-before-attempt.patch
+git apply --check "$PATCH"
 ```
 
-如果检查失败，应按下文“Hook 设计”将同等逻辑移植到新版本，而不是强制应用补丁。未安装 Hook 的 MaiBot 会因无法注册该 HookHandler 而拒绝加载本插件。
+正向检查成功说明补丁尚未应用且与当前源码兼容；反向检查成功说明补丁已经存在。只有正向和反向检查都失败时，才可能是新版源码不兼容或文件存在混合改动，此时应按下文“Hook 设计”将同等逻辑移植到新版本，而不是强制应用补丁。未安装 Hook 的 MaiBot 会因无法注册该 HookHandler 而拒绝加载本插件。
 
 ## 每日模型配额配置
+
+项目根目录提供了带逐项中文注释的 [`config.example.toml`](./config.example.toml)。该文件仅作参考，不会被插件自动加载；请把需要的字段复制到 MaiBot 已生成的插件配置中，或通过 WebUI 填写。
+
+如果只需要“单模型每日 Token 配额与自动 fallback”，建议保留 `plugin.enabled = true` 和 `model_quotas.enabled = true`，同时关闭 `static_limits`、`budget`、`error_rules`。后三项属于兼容保留的全局 Hold 功能。
 
 可在 WebUI 的“模型每日配额”分组中配置，也可使用对应 TOML：
 
