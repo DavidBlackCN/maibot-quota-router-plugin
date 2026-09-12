@@ -2,7 +2,7 @@
 
 一个 Maibot 插件，为 MaiBot 提供单模型自然日 Token 配额与自动降级路由，同时保留原 `maibot_plugin_hold_on` 的静态限制、动态预算、错误阈值、通知和管理命令。
 
-开发参考版本：**MaiBot v1.2.3**
+开发与验证基线：**MaiBot 1.2.4、maibot-plugin-sdk 2.8.0**
 
 > 本插件是 [maibot_plugin_hold_on](https://github.com/FlandreSatori/maibot_plugin_hold_on) 的分支，使用其 **LLM usage 统计、按 model 区分、Token 计数、预算规则** 等基础，并为插件行为新增 **单模型每日 Token 配额与自动降级路由**
 
@@ -18,7 +18,7 @@
 
 ## 安装要求
 
-模型级路由依赖新的 `llm.model.before_attempt` Hook。当前 MaiBot 主线尚未内置该 Hook，需要先在 MaiBot 仓库根目录检查并应用随插件提供的补丁：
+模型级路由依赖新的 `llm.model.before_attempt` Hook。**MaiBot 1.2.4 仍未原生提供该 Hook，必须保留并应用 `patches/maibot-llm-model-before-attempt.patch`**。请先在 MaiBot 仓库根目录检查并应用随插件提供的补丁：
 
 ```bash
 PATCH=/path/to/maibot-quota-router-plugin/patches/maibot-llm-model-before-attempt.patch
@@ -38,7 +38,7 @@ git apply --check --reverse "$PATCH"
 git diff -- src/llm_models/utils_model.py src/plugin_runtime/hook_catalog.py
 ```
 
-补丁基于 MaiBot 主线提交 `27ddf1e8e43531cacb09d385f564cd626366adc3` 制作，只修改：
+补丁已在 MaiBot 1.2.4（提交 `21cd74d81d47b6f77ba5ab7116a88916e957d15b`）上通过 `git apply --check` 验证，只修改：
 
 - `src/llm_models/utils_model.py`
 - `src/plugin_runtime/hook_catalog.py`
@@ -123,7 +123,7 @@ Hook 调度或插件执行异常时主程序采用 fail-open，继续使用当�
 ## 并发与计数边界
 
 - Token 只能在模型成功返回后从 `llm_usage` 得知。若某次请求开始时尚未达到额度，但它的最终用量跨过上限，该请求会完成；之后的新请求才被跳过。
-- 多个已经在途的并发请求无法被事后取消，因此可能使最终用量超过额度。插件使用进程内异步锁串行执行“查询并判断”，但不能预知在途请求的最终 Token。
+- 多个已经在途的并发请求无法被事后取消，因此可能使最终用量超过额度。插件使用按模型隔离的进程内异步锁：同一模型串行执行“查询并判断”，不同模型可并发检查，但仍不能预知在途请求的最终 Token。
 - Hook 每次对受控模型重新读取数据库，不使用可能延迟阻断的 TTL 缓存；代价是受控模型每次尝试增加一次 IPC 和一次数据库查询。
 - `usage_limit` 小于单模型当日成功调用数时，只能看到最近的记录并可能低估用量。应按实际调用量提高该值。
 - 只统计成功写入 `ModelUsage` 的调用；Provider 返回了 Token 但数据库写入失败时会产生少量计数误差。
@@ -137,12 +137,13 @@ Hook 调度或插件执行异常时主程序采用 fail-open，继续使用当�
 - `budget`：在指定时段内按 `strict` / `balanced` 计划曲线控制消耗。
 - `error_rules` / `error_watch`：按失败快照触发全局 Hold。
 - `notify`：限速或错误 Hold 通知。
-- `permission`：管理命令白名单。
+- `permission`：`/稍等`、`/配额`、`/解除` 管理命令白名单。
 - `plugin.forward_image_threshold`：保留原合并转发图片数量入站保护。
 
 命令：
 
 - `/稍等`：显示原有限速统计及模型每日配额状态。
+- `/配额`：以纯文本列出全部已配置模型的当日用量、剩余额度、使用比例、状态与重置时间；只读，不修改额度。
 - `/解除`：解除原有全局 Hold；不会清除 `llm_usage`，因此不能解除已经达到的每日模型配额。
 
 为兼容已有安装和配置，manifest ID 仍保留为 `maibot_plugin.hold_on`，展示名称和仓库名称已改为 `maibot-quota-router-plugin`。

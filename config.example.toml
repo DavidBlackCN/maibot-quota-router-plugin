@@ -18,7 +18,7 @@
 enabled = true
 
 # 配置结构版本。通常不要手动修改。
-config_version = "4.0.0"
+config_version = "4.1.0"
 
 # 自动读取 MaiBot 的 model_config.toml，建立模型、Provider 和功能映射。
 # 推荐保持 true；关闭后可通过 [catalog] 手动提供映射。
@@ -213,7 +213,7 @@ prefix = "[quota-router]"
 
 
 [permission]
-# 可以执行 /稍等 和 /解除 的用户白名单。
+# 可以执行 /稍等、/配额 和 /解除 的用户白名单。
 # 支持裸用户 ID，也支持“平台:用户 ID”，例如：
 # whitelist = ["123456789", "qq:987654321"]
 # 空数组表示没有用户可以执行管理命令。

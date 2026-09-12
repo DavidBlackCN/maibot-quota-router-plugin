@@ -50,7 +50,7 @@ class PluginConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用消耗限速")
-    config_version: str = Field(default="4.0.0", description="配置版本")
+    config_version: str = Field(default="4.1.0", description="配置版本")
     auto_detect_models: bool = Field(default=True, description="自动同步模型、厂商和功能")
     model_config_path: str = Field(default="", description="宿主 model_config.toml 路径，留空自动查找")
     forward_image_threshold: int = Field(default=0, ge=0, description="合并转发消息图片数达到该值时阻止入站；0 表示禁用")
@@ -207,7 +207,8 @@ class QuotaRouterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
-        self._quota_lock = asyncio.Lock()
+        self._quota_locks: Dict[str, asyncio.Lock] = {}
+        self._sync_quota_locks()
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
@@ -227,6 +228,7 @@ class QuotaRouterPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
+        self._sync_quota_locks()
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
 
@@ -332,6 +334,46 @@ class QuotaRouterPlugin(MaiBotPlugin):
                 return item
         return None
 
+    def _sync_quota_locks(self) -> None:
+        """让锁映射只覆盖当前配置的有限模型集合。"""
+
+        current = getattr(self, "_quota_locks", {})
+        names = {
+            str(item.model or "").strip()
+            for item in self.config.model_quotas.items or []
+            if str(item.model or "").strip()
+        }
+        self._quota_locks = {
+            name: current.get(name) or asyncio.Lock()
+            for name in names
+        }
+        self._quota_locks.update(
+            {
+                name: lock
+                for name, lock in current.items()
+                if name not in names and lock.locked()
+            }
+        )
+
+    def _discard_stale_quota_lock(self, model_name: str, lock: asyncio.Lock) -> None:
+        if self._find_model_quota(model_name) is not None or lock.locked():
+            return
+        if self._quota_locks.get(model_name) is lock:
+            self._quota_locks.pop(model_name, None)
+
+    def _quota_lock_for(self, model_name: str) -> asyncio.Lock:
+        """返回指定模型的锁；调用方已确认该模型存在配额配置。"""
+
+        locks = getattr(self, "_quota_locks", None)
+        if locks is None:
+            locks = {}
+            self._quota_locks = locks
+        lock = locks.get(model_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[model_name] = lock
+        return lock
+
     async def _check_model_quota(
         self,
         model_name: str,
@@ -394,6 +436,7 @@ class QuotaRouterPlugin(MaiBotPlugin):
                     "model": model_name,
                     "actual": progress["actual"],
                     "limit": progress["limit"],
+                    "remaining": progress["remaining"],
                     "blocked": progress["actual"] >= progress["limit"],
                     "reset_at": end,
                 }
@@ -808,6 +851,43 @@ class QuotaRouterPlugin(MaiBotPlugin):
     def _format_tokens_m(tokens: float) -> str:
         return f"{float(tokens) / 1_000_000:.3f}M"
 
+    @classmethod
+    def _format_quota_tokens(cls, tokens: float) -> str:
+        return "0" if float(tokens) == 0 else cls._format_tokens_m(tokens)
+
+    @classmethod
+    def _format_model_quota_rows(cls, rows: list[Dict[str, Any]]) -> str:
+        """格式化模型自然日配额，供独立命令和 /稍等 共用。"""
+
+        if not rows:
+            return "当前未配置模型每日配额"
+        lines: list[str] = []
+        reset_times: set[datetime] = set()
+        for row in rows:
+            actual = float(row.get("actual") or 0)
+            limit = float(row.get("limit") or 0)
+            remaining = max(0.0, float(row.get("remaining") or 0))
+            percentage = actual / limit * 100 if limit > 0 else 0.0
+            status = "已达限额" if bool(row.get("blocked")) else "可用"
+            lines.extend(
+                [
+                    str(row.get("model") or "-"),
+                    f"已使用 {cls._format_quota_tokens(actual)} / "
+                    f"{cls._format_quota_tokens(limit)}（{percentage:.1f}%）",
+                    f"剩余 {cls._format_quota_tokens(remaining)}",
+                    f"状态：{status}",
+                    "",
+                ]
+            )
+            reset_at = row.get("reset_at")
+            if isinstance(reset_at, datetime):
+                reset_times.add(reset_at)
+        if len(reset_times) == 1:
+            lines.append(f"重置：{next(iter(reset_times)):%m-%d %H:%M}")
+        elif reset_times:
+            lines.extend(f"重置：{reset_at:%m-%d %H:%M}" for reset_at in sorted(reset_times))
+        return "\n".join(lines).rstrip()
+
     @staticmethod
     def _format_event_time(ts: float) -> str:
         if ts <= 0:
@@ -945,19 +1025,7 @@ class QuotaRouterPlugin(MaiBotPlugin):
         if quota_rows:
             lines.append("")
             lines.append("【模型每日配额】")
-            for quota in quota_rows:
-                state = "已跳过" if bool(quota.get("blocked")) else "可用"
-                lines.append(f"【model:{quota.get('model') or '-'}】{state}")
-                lines.append(
-                    self._format_progress_bar(
-                        float(quota.get("actual") or 0),
-                        float(quota.get("limit") or 0),
-                        "tokens",
-                    )
-                )
-                reset_at = quota.get("reset_at")
-                if isinstance(reset_at, datetime):
-                    lines.append(f"自然日重置 {reset_at:%m-%d %H:%M}")
+            lines.append(self._format_model_quota_rows(quota_rows))
 
         lines.append("")
         lines.append("【统计】")
@@ -1022,8 +1090,9 @@ class QuotaRouterPlugin(MaiBotPlugin):
         if self._find_model_quota(model_name) is None:
             return {"action": "continue"}
 
+        lock = self._quota_lock_for(model_name)
         try:
-            async with self._quota_lock:
+            async with lock:
                 decision = await self._check_model_quota(model_name)
         except Exception as exc:
             self.ctx.logger.warning(
@@ -1033,6 +1102,8 @@ class QuotaRouterPlugin(MaiBotPlugin):
                 exc_info=True,
             )
             return {"action": "continue"}
+        finally:
+            self._discard_stale_quota_lock(model_name, lock)
 
         if decision is None:
             return {"action": "continue"}
@@ -1119,6 +1190,17 @@ class QuotaRouterPlugin(MaiBotPlugin):
                 quota_rows=quota_rows,
             ),
         )
+
+    @Command("quota_status", description="查看模型每日配额", pattern=r"/配额\s*$")
+    async def cmd_quota(self, **kwargs: Any):
+        stream_id = kwargs.get("stream_id", "")
+        if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
+            return await self._send(stream_id, "权限不足。")
+        rows = await self._model_quota_status_rows(datetime.now())
+        text = self._format_model_quota_rows(rows)
+        if rows:
+            text = f"【模型每日配额】\n\n{text}"
+        return await self._send(stream_id, text)
 
     @Command("holdon_clear", description="解除限制", pattern=r"/解除\s*$")
     async def cmd_clear(self, **kwargs: Any):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
@@ -14,6 +15,8 @@ ErrorHandler = Callable[..., Awaitable[None]]
 
 
 class ErrorSnapshotWatcher:
+    _SEEN_LIMIT = 5000
+
     def __init__(
         self,
         *,
@@ -26,7 +29,8 @@ class ErrorSnapshotWatcher:
         self._interval = max(0.5, float(interval_seconds or 2.0))
         self._on_error = on_error
         self._logger = logger
-        self._seen: Set[str] = set()
+        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._watermark: tuple[int, str] = (0, "")
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._bootstrapped = False
@@ -49,15 +53,7 @@ class ErrorSnapshotWatcher:
 
     async def _loop(self) -> None:
         if not self._bootstrapped:
-            for path in self._iter_snapshot_files():
-                self._seen.add(str(path.resolve()))
-            self._bootstrapped = True
-            self._logger.info(
-                "hold_on 错误快照监听已启动：roots=%s interval=%.1fs seen=%s",
-                [str(r) for r in self._roots],
-                self._interval,
-                len(self._seen),
-            )
+            self._bootstrap()
         while not self._stop.is_set():
             try:
                 await self._scan_once()
@@ -67,6 +63,19 @@ class ErrorSnapshotWatcher:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except asyncio.TimeoutError:
                 continue
+
+    def _bootstrap(self) -> None:
+        existing = self._snapshot_entries(mature_only=False)
+        for mtime_ns, key, _path in existing[-self._SEEN_LIMIT :]:
+            self._remember(key)
+            self._watermark = max(self._watermark, (mtime_ns, key))
+        self._bootstrapped = True
+        self._logger.info(
+            "hold_on 错误快照监听已启动：roots=%s interval=%.1fs seen=%s",
+            [str(r) for r in self._roots],
+            self._interval,
+            len(self._seen),
+        )
 
     def _iter_snapshot_files(self) -> List[Path]:
         files: List[Path] = []
@@ -85,18 +94,11 @@ class ErrorSnapshotWatcher:
         return files
 
     async def _scan_once(self) -> None:
-        for path in self._iter_snapshot_files():
-            key = str(path.resolve())
-            if key in self._seen:
+        entries = self._snapshot_entries(mature_only=True)
+        for mtime_ns, key, path in entries:
+            if key in self._seen or (mtime_ns, key) <= self._watermark:
                 continue
-            try:
-                if time.time() - path.stat().st_mtime < 0.2:
-                    continue
-            except OSError:
-                continue
-            self._seen.add(key)
-            if len(self._seen) > 5000:
-                self._seen = set(list(self._seen)[-2500:])
+            self._remember(key)
             payload = self._read_json(path)
             if not payload:
                 continue
@@ -107,6 +109,30 @@ class ErrorSnapshotWatcher:
                 await self._on_error(**extracted)
             except Exception as exc:
                 self._logger.warning("hold_on 处理错误快照失败 %s: %s", path.name, exc)
+        if entries:
+            self._watermark = max(self._watermark, entries[-1][:2])
+
+    def _snapshot_entries(self, *, mature_only: bool) -> List[tuple[int, str, Path]]:
+        """按修改时间稳定排序快照；水位线让已淘汰路径不会再次进入处理队列。"""
+
+        cutoff_ns = time.time_ns() - 200_000_000 if mature_only else None
+        entries: List[tuple[int, str, Path]] = []
+        for path in self._iter_snapshot_files():
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+                if cutoff_ns is not None and mtime_ns > cutoff_ns:
+                    continue
+                entries.append((mtime_ns, str(path.resolve()), path))
+            except OSError:
+                continue
+        entries.sort(key=lambda item: (item[0], item[1]))
+        return entries
+
+    def _remember(self, key: str) -> None:
+        self._seen[key] = None
+        self._seen.move_to_end(key)
+        while len(self._seen) > self._SEEN_LIMIT:
+            self._seen.popitem(last=False)
 
     @staticmethod
     def _read_json(path: Path) -> Optional[Dict[str, Any]]:
