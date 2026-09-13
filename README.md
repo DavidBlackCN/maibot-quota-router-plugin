@@ -2,7 +2,7 @@
 
 一个 Maibot 插件，为 MaiBot 提供单模型自然日 Token 配额与自动降级路由，同时保留原 `maibot_plugin_hold_on` 的静态限制、动态预算、错误阈值、通知和管理命令。
 
-开发与验证基线：**MaiBot 1.2.4、maibot-plugin-sdk 2.8.0**
+开发与验证基线：**MaiBot 1.2.5、maibot-plugin-sdk 2.8.0**
 
 > 本插件是 [maibot_plugin_hold_on](https://github.com/FlandreSatori/maibot_plugin_hold_on) 的分支，使用其 **LLM usage 统计、按 model 区分、Token 计数、预算规则** 等基础，并为插件行为新增 **单模型每日 Token 配额与自动降级路由**
 
